@@ -253,10 +253,7 @@ static struct PyModuleDef moduledef = {{
         self.print_init(sio)
 
         rval = sio.getvalue()
-        # Make sure the hash of the code hasn't changed
-        h = hash_from_code(rval)
-        assert self.code_hash is None or self.code_hash == h
-        self.code_hash = h
+        self.code_hash = hash_from_code(rval)
         rval = re.sub(self.hash_placeholder, self.code_hash, rval)
         # Finalize the Module, so no support code or function
         # can be added
@@ -1770,8 +1767,6 @@ class GCC_compiler(Compiler):
     # The equivalent flags of --march=native used by g++.
     march_flags = None
 
-    supports_amdlibm = True
-
     @staticmethod
     def version_str():
         return theano.config.cxx + " " + gcc_version_str
@@ -1804,6 +1799,7 @@ class GCC_compiler(Compiler):
 
         if ('g++' not in theano.config.cxx and
                 'clang++' not in theano.config.cxx):
+            """ # Jinlong comment 20151010
             _logger.warn(
                 "OPTIMIZATION WARNING: your Theano flag `cxx` seems not to be"
                 " the g++ compiler. So we disable the compiler optimization"
@@ -1812,6 +1808,7 @@ class GCC_compiler(Compiler):
                 "         You can add those parameters to the compiler yourself"
                 " via the Theano flag `gcc.cxxflags`."
             )
+            """
             detect_march = False
 
         if detect_march:
@@ -2008,8 +2005,7 @@ class GCC_compiler(Compiler):
         # or 64 bit and compile accordingly. This step is ignored for ARM
         # architectures in order to make Theano compatible with the Raspberry
         # Pi, and Raspberry Pi 2.
-        if (not any(['arm' in flag for flag in cxxflags]) and
-                'arm' not in platform.machine()):
+        if not any(['arm' in flag for flag in cxxflags]) and platform.machine() != 'armv7l':
             n_bits = local_bitwidth()
             cxxflags.append('-m%d' % n_bits)
             _logger.debug("Compiling for %s bit architecture", n_bits)
@@ -2122,9 +2118,8 @@ class GCC_compiler(Compiler):
             cppfile.write('\n')
         cppfile.close()
 
-        lib_filename = os.path.join(
-            location,
-            '%s.%s' % (module_name, get_lib_extension()))
+        lib_filename = os.path.join(location, '%s.%s' %
+                                    (module_name, get_lib_extension()))
 
         _logger.debug('Generating shared lib %s', lib_filename)
         cmd = [theano.config.cxx, get_gcc_shared_library_arg(), '-g']
