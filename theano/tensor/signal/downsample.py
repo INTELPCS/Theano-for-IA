@@ -346,7 +346,201 @@ class DownsampleFactorMax(Op):
         ds0, ds1 = self.ds
         st0, st1 = self.st
         pd0, pd1 = self.padding
-        ccode = """
+
+        # Jinlong added 2015-10-13        
+        d={}
+        d["x"]=x
+        d["ds1"]=ds1
+        d["ds0"]=ds0
+        d["st0"]=st0
+        d["st1"]=st1
+        def my_dup(st, start,end):
+                s = ""
+                for i in xrange(start, end):
+                        d["index"] = i 
+                        s += st % d 
+                return s + "\n"
+        ret = """ 
+        int typenum = PyArray_ObjectType((PyObject*)%(x)s, 0);
+        int x_shp0_usable;
+        int x_shp1_usable;
+        int z_shp0, z_shp1;
+        if(PyArray_NDIM(%(x)s)!=4)
+        {
+            PyErr_SetString(PyExc_ValueError, "x must be a 4d ndarray");
+            %(fail)s;
+        }
+        z_shp0 = PyArray_DIMS(%(x)s)[2] / %(st0)s; //stride 0
+        z_shp1 = PyArray_DIMS(%(x)s)[3] / %(st1)s; //stride 1
+        x_shp0_usable = PyArray_DIMS(%(x)s)[2];
+        x_shp1_usable = PyArray_DIMS(%(x)s)[3]; 
+        int rowEdge= ((PyArray_DIMS(%(x)s)[2] %% %(st0)s) !=0 );
+        int colEdge= ((PyArray_DIMS(%(x)s)[3] %% %(st1)s) !=0 );
+        if (%(ignore_border)s)
+        {
+            z_shp0 = 1 +  (x_shp0_usable - %(ds0)s) / %(st0)s;
+            z_shp1 = 1 + (x_shp0_usable - %(ds1)s) / %(st1)s;
+        }
+        else
+        {
+            z_shp0 += rowEdge;
+            z_shp1 += colEdge;   
+        }
+        if ((!%(z)s)
+          || *PyArray_DIMS(%(z)s)!=4
+          ||(PyArray_DIMS(%(z)s)[0] != PyArray_DIMS(%(x)s)[0])
+          ||(PyArray_DIMS(%(z)s)[1] != PyArray_DIMS(%(x)s)[1])
+          ||(PyArray_DIMS(%(z)s)[2] != z_shp0)                                                        
+          ||(PyArray_DIMS(%(z)s)[3] != z_shp1)
+          )
+        {
+          if(%(z)s)Py_XDECREF(%(z)s);
+          npy_intp dims[4] = {0,0,0,0};
+          dims[0]=PyArray_DIMS(%(x)s)[0];
+          dims[1]=PyArray_DIMS(%(x)s)[1];
+          dims[2]=z_shp0;
+          dims[3]=z_shp1;
+          //TODO: zeros not necessary
+          %(z)s = (PyArrayObject*) PyArray_ZEROS(4, dims, typenum,0);
+        }
+        if (z_shp0 && z_shp1)
+        {
+            npy_intp *inStrds=PyArray_STRIDES(%(x)s);
+            npy_intp *zStrds=PyArray_STRIDES(%(z)s);
+            npy_intp *inDim=PyArray_DIMS(%(x)s);
+            npy_intp *zDim=PyArray_DIMS(%(z)s);
+        """ % locals()
+        if self.ignore_border == False:
+                ret += """ 
+                        z_shp0 = 1 +  (x_shp0_usable - %(ds0)s) / %(st0)s;
+                        z_shp1 = 1 + (x_shp0_usable - %(ds1)s) / %(st1)s;
+                        """ % d
+        ret += """
+            //DownSample
+            #pragma omp parallel for schedule(dynamic,10) num_threads(32)
+            for(int b=0;b<PyArray_DIMS(%(x)s)[0];b++){
+              for(int k=0;k<PyArray_DIMS(%(x)s)[1];k++){
+                const dtype_%(x)s * __restrict__ in=(dtype_%(x)s *)(PyArray_GETPTR2(%(x)s, b, k));
+                dtype_%(x)s * __restrict__ out=(dtype_%(x)s *)(PyArray_GETPTR2(%(z)s, b, k));
+                dtype_%(x)s buf[%(ds1)s];
+                for(int zi=0; zi<z_shp0; zi++)
+                {
+                    dtype_%(x)s * __restrict__ outRow=&out[zi*zDim[3]];
+                    #pragma prefetch outRow
+                    for (int zj=0; zj<z_shp1; zj++)
+                    {
+
+                        int i=zi * %(st0)s;
+                        int j = zj * %(st1)s;
+                        const dtype_%(x)s * __restrict__ inRow=&in[i*inDim[3]];
+                        #pragma simd
+                        for(int m =0; m<%(ds1)s;m++)buf[m]=inRow[m+j]>inRow[inDim[3] + m+j]?inRow[m+j]:inRow[inDim[3]+ m+j];//cmp 0 and 1 row.
+                """ % locals()
+        ret += my_dup("\n#pragma simd\nfor(int m =0; m<%(ds1)s;m++)buf[m]=buf[m]>inRow[%(index)s * inDim[3] + m+j]?buf[m]:inRow[%(index)s * inDim[3]+ m+j];",2,ds0)
+        ret += """
+                    #pragma simd
+                    for(int m=1; m<%(ds1)s;m++)
+                    { 
+                        buf[0] = buf[0] > buf[m]?buf[0]:buf[m];
+                    }
+                   outRow[zj] = buf[0];
+                        
+                  """ % locals()               
+        ret += """                                         
+                } //for zj
+               } //for zi
+              """ 
+        #print (ignore_border == 0)
+        #sys.exit(0)
+        if self.ignore_border == False:
+                ret += """
+                        int RowStart = z_shp0;
+                        int ColStart = z_shp1;
+                        int RowEnd = x_shp0_usable / %(st0)s + rowEdge;
+                        int ColEnd = x_shp1_usable / %(st1)s + colEdge;
+                        if(RowStart < RowEnd) // has Row needs to compute
+                        {
+                                for(int zi = RowStart;zi<RowEnd;zi++)
+                                {
+                                        dtype_%(x)s * __restrict__ outRow=&out[zi*zDim[3]];
+                                        for(int zj = 0; zj < ColStart;zj++)
+                                        {
+                                                buf[0]=0;
+                                                for(int m =0;m<%(ds0)s;m++)
+                                                {
+                                                        int i =zi * %(st0)s +m;
+                                                        if(i >= x_shp0_usable)continue;
+                                                        const dtype_%(x)s * __restrict__ inRow=&in[i* inDim[3]];
+                                                        for(int n =0; n<%(ds1)s;n++)
+                                                        {
+                                                                int j = zj* %(st1)s + n;
+                                                                buf[0] = buf[0]>inRow[j]?buf[0]:inRow[j];
+                                                        }
+                                                }
+                                                outRow[zj]=buf[0];
+                                        }
+
+                                }
+                                
+                        }
+                
+                        if(ColStart < ColEnd)
+                        {
+                                for(int zi = 0;zi<RowStart;zi++)
+                                {
+                                        dtype_%(x)s * __restrict__ outRow=&out[zi*zDim[3]];
+                                        for(int zj=ColStart;zj<ColEnd;zj++)
+                                        {
+                                                buf[0]=0;
+                                                for(int m =0;m<%(ds0)s;m++)
+                                                {
+                                                        int i =zi * %(st0)s +m;
+                                                        const dtype_%(x)s * __restrict__ inRow=&in[i* inDim[3]];
+                                                        for(int n =0; n<%(ds1)s;n++)
+                                                        {
+                                                                int j = zj* %(st1)s + n;
+                                                                if(j>= x_shp1_usable)continue;
+                                                                buf[0] = buf[0]>inRow[j]?buf[0]:inRow[j];
+                                                        }
+                                                }
+                                                outRow[zj]=buf[0];
+                                        }
+                                        
+                                }
+                        }                        
+                        for(int zi = RowStart;zi<RowEnd;zi++)
+                        {
+                                dtype_%(x)s * __restrict__ outRow=&out[zi*zDim[3]];
+                                for(int zj=ColStart;zj<ColEnd;zj++)
+                                {
+                                        buf[0]=0;
+                                        for(int m =0;m<%(ds0)s;m++)
+                                        {
+                                                int i = zi * %(st0)s+m;
+                                                if(i >= x_shp0_usable)
+                                                        continue;
+                                                const dtype_%(x)s * __restrict__ inRow=&in[i* inDim[3]];
+                                                for(int n =0; n<%(ds1)s;n++)
+                                                {
+                                                        int j = zj* %(st1)s + n;
+                                                        if(j>=x_shp1_usable)
+                                                                continue;
+                                                        buf[0] = buf[0]>inRow[j]?buf[0]:inRow[j];
+                                                }
+                                        }
+                                        outRow[zj]=buf[0];
+                                }                               
+                        }
+                        """ % d
+        ret += """
+              } //for k
+            } //for b
+        }
+        """
+        #Jinlong:Warn: ignore border, padding, sum, average pooling not handled
+        return ret
+
+        theano_07_ccode = """
         int typenum = PyArray_ObjectType((PyObject*)%(x)s, 0);
         int z_r, z_c; // shape of the output
         int r, c; // shape of the padded_input
@@ -360,7 +554,7 @@ class DownsampleFactorMax(Op):
         r += %(pd0)s * 2;
         c += %(pd1)s * 2;
 
-        if (%(pd0)s != 0 && %(pd1)s != 0 && !%(ignore_border)s)
+        if (%(pd)s != 0 && %(pd1)s != 0 && !%(ignore_border)s)
             {
               PyErr_SetString(PyExc_ValueError,
                 "padding must be (0,0) when ignore border is False");
@@ -432,6 +626,8 @@ class DownsampleFactorMax(Op):
         dtype_%(x)s collector; // temp var for the value in a region
         if (z_r && z_c)
         {
+            // Jinlong added 20151012
+            //#pragma omp parallel for schedule(dynamic,10) num_threads(32)
             for(int b=0; b<PyArray_DIMS(%(x)s)[0]; b++){
               for(int k=0; k<PyArray_DIMS(%(x)s)[1]; k++){
                 for(int i=0; i< z_r; i++){
@@ -691,7 +887,228 @@ class MaxPoolGrad(PoolGrad):
         ds0, ds1 = self.ds
         st0, st1 = self.st
         pd0, pd1 = self.padding
-        return """
+
+        # Jinlong added: 2015-10-13
+        d={}
+        d['ds0']=ds0
+        d['ds1']=ds1
+        d['st1']=st1
+        d['st0']=st0
+        
+        ret = """
+        int x_typenum = PyArray_ObjectType((PyObject*)%(x)s, 0);
+        int z_typenum = PyArray_ObjectType((PyObject*)%(z)s, 0);
+        int gz_typenum = PyArray_ObjectType((PyObject*)%(gz)s, 0);
+        int x_shp0_usable;
+        int x_shp1_usable;
+        int z_shp0, z_shp1;
+        if ((x_typenum != z_typenum) || (x_typenum != gz_typenum))
+        {
+            PyErr_SetString(PyExc_ValueError, "input types must all match");
+            %(fail)s;
+        }
+        if(PyArray_NDIM(%(x)s)!=4)
+        {
+            PyErr_SetString(PyExc_ValueError, "x must be a 4d ndarray");
+            %(fail)s;
+        }
+        if(PyArray_NDIM(%(z)s)!=4)
+        {
+            PyErr_SetString(PyExc_ValueError, "z must be a 4d ndarray");
+            %(fail)s;
+        }
+        if(PyArray_NDIM(%(gz)s)!=4)
+        {
+            PyErr_SetString(PyExc_ValueError, "gz must be a 4d ndarray");
+            %(fail)s;
+        }
+        z_shp0 = PyArray_DIMS(%(z)s)[2];
+        z_shp1 = PyArray_DIMS(%(z)s)[3];
+        if (%(ignore_border)s)
+        {
+            x_shp0_usable = (z_shp0 -1) * %(st0)s + %(ds0)s;
+            x_shp1_usable = (z_shp1 -1) * %(st1)s + %(ds1)s;
+        }
+        else
+        {
+            x_shp0_usable = PyArray_DIMS(%(x)s)[2];
+            x_shp1_usable = PyArray_DIMS(%(x)s)[3];
+        }
+        if ((!%(gx)s)
+          || *PyArray_DIMS(%(gx)s)!=4
+          ||(PyArray_DIMS(%(gx)s)[0] != PyArray_DIMS(%(x)s)[0])
+          ||(PyArray_DIMS(%(gx)s)[1] != PyArray_DIMS(%(x)s)[1])
+          ||(PyArray_DIMS(%(gx)s)[2] != PyArray_DIMS(%(x)s)[2])
+          ||(PyArray_DIMS(%(gx)s)[3] != PyArray_DIMS(%(x)s)[3])
+          )
+        {
+          Py_XDECREF(%(gx)s);
+          %(gx)s = (PyArrayObject*) PyArray_ZEROS(4, PyArray_DIMS(%(x)s), x_typenum,0);
+        }
+        register npy_intp zpS1 = PyArray_DIMS(%(z)s)[3];
+        register npy_intp gzpS1 =  PyArray_DIMS(%(gz)s)[3];
+        register npy_intp xpS1 =  PyArray_DIMS(%(x)s)[3];
+        register npy_intp gxpS1 =  PyArray_DIMS(%(gx)s)[3];
+
+        register npy_intp zpB1 = PyArray_DIMS(%(z)s)[1] * PyArray_DIMS(%(z)s)[2] * zpS1;
+        register npy_intp gzpB1 =  PyArray_DIMS(%(gz)s)[1] * PyArray_DIMS(%(gz)s)[2] * gzpS1;
+        register npy_intp xpB1 =  PyArray_DIMS(%(x)s)[1] * PyArray_DIMS(%(x)s)[2] * xpS1;
+        register npy_intp gxpB1 =  PyArray_DIMS(%(gx)s)[1] * PyArray_DIMS(%(gx)s)[2] * gxpS1;
+
+        register npy_intp zpB2 = PyArray_DIMS(%(z)s)[2] * zpS1;
+        register npy_intp gzpB2 = PyArray_DIMS(%(gz)s)[2] * gzpS1;
+        register npy_intp xpB2 =  PyArray_DIMS(%(x)s)[2] * xpS1;
+        register npy_intp gxpB2 = PyArray_DIMS(%(gx)s)[2] * gxpS1;
+
+        dtype_V3 * %(x)sIn= (dtype_V3*)PyArray_DATA(%(x)s);
+        dtype_V1 * %(gx)sIn= (dtype_V1*)PyArray_DATA(%(gx)s);
+        dtype_V5 * %(z)sIn= (dtype_V5*)PyArray_DATA(%(z)s);
+        dtype_V7 * %(gz)sIn= (dtype_V7*)PyArray_DATA(%(gz)s);
+        """ % locals()
+        if self.ignore_border ==0:
+                ret += """
+                        z_shp0 = 1 + (x_shp0_usable - %(ds0)s)/%(st0)s;
+                        z_shp1 = 1 + (x_shp1_usable - %(ds1)s)/%(st1)s;
+                        """ % d
+        ret += """
+                //downsample
+                //#pragma omp parallel for schedule(dynamic,10) num_threads(400)// Jinlong added to turn on openmp on CPU
+        #pragma omp parallel for schedule(dynamic,10) num_threads(32)
+        for(int b=0;b<PyArray_DIMS(%(x)s)[0];b++)
+        {
+          for(int k=0;k<PyArray_DIMS(%(x)s)[1];k++)
+          {
+                 register dtype_V3 * in1 = & %(x)sIn[b*xpB1+k*xpB2];//(dtype_V3 *)PyArray_GETPTR2(%(x)s,b,k);
+                 register dtype_V1 * in2 = & %(gx)sIn[b*gxpB1+k*gxpB2]; //((dtype_V1*)PyArray_GETPTR2(%(gx)s,b,k));
+                 register dtype_V5 * in3 =  & %(z)sIn[b*zpB1 + k*zpB2]; //(dtype_V5*)PyArray_GETPTR2(%(z)s,b,k);
+                 register dtype_V7 * in4 = & %(gz)sIn[b*gzpB1 + k*gzpB2]; //(dtype_V7*)PyArray_GETPTR2(%(gz)s,b,k);
+                 for(int i=0; i< x_shp0_usable;i++)//init
+                 {
+                        register dtype_V1 * __restrict__ gxp2 = & in2[i*gxpS1];
+                        #pragma simd
+                        for(int j=0; j< x_shp1_usable;j++)
+                                gxp2[j]=0;              
+                 }
+        """ % locals()
+        ret +=   """    
+                 for(int zi=0; zi< z_shp0; zi++)
+                 {
+                        register dtype_V5 * __restrict__ zp = & in3[zi *zpS1];
+                        register dtype_V7 * __restrict__ gzp =  & in4[zi*gzpS1];
+                        for(int zj =0;zj < z_shp1;zj++)
+                        {
+                                for(int di =0; di< %(ds0)s;di++)
+                                {
+                                        int i = zi* %(st0)s + di;
+                                        register dtype_V3 * __restrict__ xp = & in1[i *xpS1];
+                                        register dtype_V1 * __restrict__ gxp = & in2[i*gxpS1];
+                                        for(int dj=0; dj <%(ds1)s;dj++)
+                                        {
+                                                int j =zj * %(st1)s + dj;
+                                                dtype_V1 tmp = gxp[j];
+                                                gxp[j] = (xp[j] == zp[zj]) * gzp[zj] + (xp[j] != zp[zj]) * tmp;
+                                                ///gxp[j] = (xp[j] != zp[zj])? gxp[j]:gzp[zj]; //has branch
+                                        }
+                                }
+                        }
+                  }
+                """ % locals()
+        if self.ignore_border ==0:
+                ret += """
+                        int rowStart = z_shp0;
+                        int colStart = z_shp1;
+                        int rowEnd = x_shp0_usable / %(st0)s + ((x_shp0_usable %% %(st0)s) !=0);
+                        int colEnd = x_shp1_usable / %(st1)s + ((x_shp1_usable %% %(st1)s) !=0);
+                        if(rowStart < rowEnd)
+                        {
+                                for(int zi=rowStart; zi< rowEnd; zi++)
+                                {
+                                        register dtype_V5 * __restrict__ zp = & in3[zi *zpS1];
+                                        register dtype_V7 * __restrict__ gzp =  & in4[zi*gzpS1];
+                                        for(int zj =0;zj < z_shp1;zj++)
+                                        {
+                                                for(int di =0; di< %(ds0)s;di++)
+                                                {
+                                                        int i = zi* %(st0)s + di;
+                                                        if(i>=  x_shp0_usable)
+                                                                continue;
+                                                        register dtype_V3 * __restrict__ xp = & in1[i *xpS1];
+                                                        register dtype_V1 * __restrict__ gxp = & in2[i*gxpS1];
+                                                        for(int dj=0; dj <%(ds1)s;dj++)
+                                                        {
+                                                                int j =zj * %(st1)s + dj;
+                                                                dtype_V1 tmp = gxp[j];
+                                                                gxp[j] = (xp[j] == zp[zj]) * gzp[zj] + (xp[j] != zp[zj]) * tmp; 
+
+                                                        }
+
+                                                }
+                                        }
+                                }
+
+                        }
+                        if(colStart < colEnd)
+                        {
+                                for(int zi=0; zi< z_shp0; zi++)
+                                {
+                                        register dtype_V5 * __restrict__ zp = & in3[zi *zpS1];
+                                        register dtype_V7 * __restrict__ gzp =  & in4[zi*gzpS1];
+                                        for(int zj =colStart;zj < colEnd;zj++)
+                                        {
+                                                for(int di =0; di< %(ds0)s;di++)
+                                                {
+                                                        int i = zi* %(st0)s + di;
+                                                        register dtype_V3 * __restrict__ xp = & in1[i *xpS1];
+                                                        register dtype_V1 * __restrict__ gxp = & in2[i*gxpS1];
+                                                        for(int dj=0; dj <%(ds1)s;dj++)
+                                                        {
+                                                                int j =zj * %(st1)s + dj;
+                                                                if(j >= x_shp1_usable)
+                                                                        continue;
+                                                                ///gxp[j] = (xp[j] == zp[zj])?gxp[j]:gzp[zj];
+                                                                dtype_V1 tmp = gxp[j];
+                                                                gxp[j] = (xp[j] == zp[zj]) * gzp[zj] + (xp[j] != zp[zj]) * tmp;
+                                                        }
+                                                }
+                                        }
+                                }
+                                
+                        }
+                        for(int zi=rowStart; zi< rowEnd; zi++)
+                        {
+                                register dtype_V5 * __restrict__ zp = & in3[zi *zpS1];
+                                register dtype_V7 * __restrict__ gzp =  & in4[zi*gzpS1];
+                                for(int zj =colStart;zj < colEnd;zj++)
+                                {
+                                        for(int di =0; di< %(ds0)s;di++)
+                                        {
+                                                int i = zi* %(st0)s + di;
+                                                if(i>=  x_shp0_usable)
+                                                        continue;
+                                                register dtype_V3 * __restrict__ xp = & in1[i *xpS1];
+                                                register dtype_V1 * __restrict__ gxp = & in2[i*gxpS1];
+                                                for(int dj=0; dj <%(ds1)s;dj++) 
+
+                                                {
+                                                        int j =zj * %(st1)s + dj;
+                                                        if(j >= x_shp1_usable)
+                                                                continue;
+                                                        ////gxp[j] = (xp[j] == zp[zj])? gxp[j]:gzp[zj];
+                                                        dtype_V1 tmp = gxp[j];
+                                                        gxp[j] = (xp[j] == zp[zj]) * gzp[zj] + (xp[j] != zp[zj])*tmp;
+                                                }
+                                        }
+                                }
+                        }
+                """ %locals()
+        ret +="""
+                }//k
+              }//b
+              """
+        return ret
+
+
+        theano_07_ccode = """
         // sanity checks
         int x_typenum = PyArray_ObjectType((PyObject*)%(x)s, 0);
         int z_typenum = PyArray_ObjectType((PyObject*)%(z)s, 0);
